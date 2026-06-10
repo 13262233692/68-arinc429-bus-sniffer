@@ -1,9 +1,13 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 
 use arinc429_sniffer::core::word::WordEndianness;
 use arinc429_sniffer::core::types::PayloadFormat;
@@ -11,6 +15,8 @@ use arinc429_sniffer::io::reader::{ArincDumpReader, DumpFormat};
 use arinc429_sniffer::io::pipeline::WordPipeline;
 use arinc429_sniffer::ui::printer::{DisplayOptions, OutputMode, OutputPrinter};
 use arinc429_sniffer::core::dictionary::get_avionics_dictionary;
+use arinc429_sniffer::timing::JitterGrade;
+use arinc429_sniffer::replay::{InjectionStrategy, ReplayConfig, ReplayScheduler, BusPortPool};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,6 +55,9 @@ enum Commands {
 
     #[command(name = "info", about = "Display build info and supported features")]
     Info,
+
+    #[command(name = "replay", about = "Fault Injection: replay capture stream to hardware bus with original timing")]
+    Replay(ReplayArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -111,6 +120,57 @@ struct GenDataArgs {
     seed: Option<u64>,
 }
 
+#[derive(clap::Args, Debug)]
+struct ReplayArgs {
+    #[arg(value_name = "FILE", help = "Captured binary dump to replay")]
+    file: PathBuf,
+
+    #[arg(short = 'p', long = "port", help = "ARINC 429 transmit port index, may be repeated")]
+    ports: Vec<u8>,
+
+    #[arg(short = 'x', long = "speed", default_value_t = 1.0, help = "Replay speed multiplier (1.0 = realtime)")]
+    speed: f64,
+
+    #[arg(short = 'n', long = "loop", default_value_t = 1, help = "Number of replay cycles")]
+    cycles: u32,
+
+    #[arg(long = "strategy", value_enum, default_value_t = StrategyArg::RoundRobin)]
+    strategy: StrategyArg,
+
+    #[arg(long = "dry-run", default_value_t = false, help = "Simulate injection without touching hardware")]
+    dry_run: bool,
+
+    #[arg(long = "auto-start", default_value_t = false, help = "Start immediately without waiting for ENTER")]
+    auto_start: bool,
+
+    #[arg(long = "sink-file", help = "Write injected raw bytes to this file instead of hardware (supercedes --port)")]
+    sink_file: Option<PathBuf>,
+
+    #[arg(short = 'f', long = "format", value_enum, default_value_t = FormatArg::Auto)]
+    format: FormatArg,
+
+    #[arg(short = 'e', long = "endian", value_enum, default_value_t = EndianArg::Le)]
+    endian: EndianArg,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum StrategyArg {
+    RoundRobin,
+    HashByLabel,
+    Broadcast,
+}
+
+impl StrategyArg {
+    fn to_injection_strategy(self, fixed: Option<u8>) -> InjectionStrategy {
+        match (self, fixed) {
+            (_, Some(p)) => InjectionStrategy::FixedPort(p),
+            (StrategyArg::RoundRobin, None) => InjectionStrategy::RoundRobin,
+            (StrategyArg::HashByLabel, None) => InjectionStrategy::HashByLabel,
+            (StrategyArg::Broadcast, None) => InjectionStrategy::AllPortsBroadcast,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum FormatArg {
     Auto,
@@ -165,6 +225,7 @@ fn run() -> Result<()> {
         Commands::Dict(args) => cmd_dict(args, cli.no_color),
         Commands::GenData(args) => cmd_gendata(args),
         Commands::Info => cmd_info(cli.no_color),
+        Commands::Replay(args) => cmd_replay(args, cli.no_color),
     }
 }
 
@@ -218,7 +279,7 @@ fn cmd_decode(args: DecodeArgs, no_color: bool, stats_only: bool) -> Result<()> 
         println!();
     }
 
-    let (words, reader_stats) = reader.read_all()
+    let (timed_words, reader_stats) = reader.read_all_timed()
         .with_context(|| format!("Failed to read dump file: {}", args.file.display()))?;
 
     let pipeline = WordPipeline::new()
@@ -229,17 +290,20 @@ fn cmd_decode(args: DecodeArgs, no_color: bool, stats_only: bool) -> Result<()> 
         .filter_map(|s| u16::from_str_radix(s, 8).ok())
         .collect();
 
-    let (decoded, pipeline_stats) = if label_octal_filters.is_empty() {
-        pipeline.process_all(words)
+    let (decoded, mut pipeline_stats, timing_registry) = if label_octal_filters.is_empty() {
+        pipeline.process_all_timed(timed_words)
     } else {
-        let filtered: Vec<_> = words.into_iter()
-            .filter(|w| label_octal_filters.contains(&w.label_octal()))
+        let filtered: Vec<_> = timed_words.into_iter()
+            .filter(|tw| label_octal_filters.contains(&tw.word.label_octal()))
             .collect();
         let total = filtered.len();
-        let (dec, mut stats) = pipeline.process_all(filtered);
+        let (dec, mut stats, reg) = pipeline.process_all_timed(filtered);
         stats.total_words = total;
-        (dec, stats)
+        (dec, stats, reg)
     };
+
+    let top_n = timing_registry.top_jitter_labels(10);
+    pipeline_stats.top_jitters = top_n.clone();
 
     if stats_only {
         if !no_color {
@@ -252,6 +316,7 @@ fn cmd_decode(args: DecodeArgs, no_color: bool, stats_only: bool) -> Result<()> 
         println!();
         println!("{}", reader_stats.to_string());
         println!("{}", pipeline_stats.summary());
+        print_jitter_table(&top_n, no_color, 10);
     } else {
         let mut printer = OutputPrinter::new(display_opts.clone());
         if matches!(output_mode, OutputMode::Compact) {
@@ -272,10 +337,79 @@ fn cmd_decode(args: DecodeArgs, no_color: bool, stats_only: bool) -> Result<()> 
         if !args.no_stats {
             printer.print_reader_stats(&reader_stats);
             printer.print_pipeline_stats(&pipeline_stats);
+            print_jitter_table(&top_n, no_color, 10);
         }
     }
 
     Ok(())
+}
+
+fn print_jitter_table(entries: &[(u16, arinc429_sniffer::timing::JitterStats)], no_color: bool, limit: usize) {
+    if entries.is_empty() {
+        return;
+    }
+    let title = if no_color {
+        format!("\n  Top {} Labels by Timing Jitter", limit.min(entries.len()))
+    } else {
+        format!("\n  {} Top {} Labels by Timing Jitter {}",
+            "▸".magenta().bold(),
+            limit.min(entries.len()),
+            "◂".magenta().bold())
+    };
+    println!("{}", title);
+    let sep = if no_color { "-".repeat(92) } else { "─".repeat(92).dimmed().to_string() };
+    println!("  {}", sep);
+    let header = if no_color {
+        format!("  {:>5} | {:<14} | {:>10} | {:>10} | {:>8} | {:>9} | {:>10}",
+            "LABEL", "JITTER GRADE", "PERIOD µs", "MEAN µs", "±σ µs", "PPM", "SAMPLES")
+    } else {
+        format!("  {:>5} | {:<14} | {:>10} | {:>10} | {:>8} | {:>9} | {:>10}",
+            "LABEL".bold().yellow(),
+            "JITTER GRADE".bold(),
+            "PERIOD µs".bold(),
+            "MEAN µs".bold().cyan(),
+            "±σ µs".bold().cyan(),
+            "PPM".bold().red(),
+            "SAMPLES".bold())
+    };
+    println!("{}", header);
+    println!("  {}", sep);
+
+    for (label, stats) in entries.iter().take(limit) {
+        let grade_str = format!("{:?}", stats.grade());
+        let (grade_colored, ppm_str, sigma_str) = if no_color {
+            (grade_str, format!("{:>8.1}", stats.ppm_jitter()), format!("{:>7.2}", stats.std_dev_us()))
+        } else {
+            let g = match stats.grade() {
+                JitterGrade::Subatomic => grade_str.green().to_string(),
+                JitterGrade::AerospaceGrade => grade_str.cyan().to_string(),
+                JitterGrade::Acceptable => grade_str.blue().to_string(),
+                JitterGrade::Noticeable => grade_str.yellow().to_string(),
+                JitterGrade::Degraded => format!("{}⚠ ", grade_str).yellow().to_string(),
+                JitterGrade::Anomalous => format!("{}⚠ ", grade_str).red().to_string(),
+                JitterGrade::FaultSuspected => format!("{}✘", grade_str).red().bold().to_string(),
+            };
+            let ppm = if stats.ppm_jitter() > 5000.0 {
+                format!("{:>8.1}", stats.ppm_jitter()).red().to_string()
+            } else if stats.ppm_jitter() > 1000.0 {
+                format!("{:>8.1}", stats.ppm_jitter()).yellow().to_string()
+            } else {
+                format!("{:>8.1}", stats.ppm_jitter()).green().to_string()
+            };
+            let s = if stats.std_dev_us() > 100.0 {
+                format!("{:>7.2}", stats.std_dev_us()).red().to_string()
+            } else if stats.std_dev_us() > 10.0 {
+                format!("{:>7.2}", stats.std_dev_us()).yellow().to_string()
+            } else {
+                format!("{:>7.2}", stats.std_dev_us()).green().to_string()
+            };
+            (g, ppm, s)
+        };
+        println!("  {:>4o} | {:<14} | {:>10.1} | {:>10.2} | {} | {} | {:>10}",
+            label, grade_colored, stats.period_us(), stats.mean_us(),
+            sigma_str, ppm_str, stats.sample_count());
+    }
+    println!("  {}", sep);
 }
 
 fn cmd_dict(args: DictArgs, no_color: bool) -> Result<()> {
@@ -504,3 +638,240 @@ fn cmd_info(no_color: bool) -> Result<()> {
 
     Ok(())
 }
+
+fn cmd_replay(args: ReplayArgs, no_color: bool) -> Result<()> {
+    let dump_format = match args.format {
+        FormatArg::Auto => {
+            let ext = args.file.extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            match ext.as_str() {
+                "hex" | "txt" | "log" => DumpFormat::HexText,
+                "pcap" | "cap" => DumpFormat::PcapLe,
+                _ => DumpFormat::RawBinary,
+            }
+        }
+        FormatArg::Bin => DumpFormat::RawBinary,
+        FormatArg::Hex => DumpFormat::HexText,
+        FormatArg::Pcap => DumpFormat::PcapLe,
+    };
+
+    let endianness = match args.endian {
+        EndianArg::Le => WordEndianness::Standard,
+        EndianArg::Be => WordEndianness::Reversed,
+    };
+
+    let reader = ArincDumpReader::new(&args.file)
+        .with_format(dump_format)
+        .with_endianness(endianness);
+
+    let (timed_words, reader_stats) = reader.read_all_timed()
+        .with_context(|| format!("Failed to read capture: {}", args.file.display()))?;
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let _sig_stop = stop_flag.clone();
+    let _ = _sig_stop;
+    #[cfg(unix)]
+    {
+        let sig = stop_flag.clone();
+        std::thread::spawn(move || {
+            unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGINT);
+                libc::sigaddset(&mut mask, libc::SIGTERM);
+                let mut _s = 0;
+                let timeout = libc::timespec { tv_sec: 0, tv_nsec: 250_000_000 };
+                loop {
+                    let r = libc::sigtimedwait(&mask, &mut _s, &timeout);
+                    if r == libc::SIGINT || r == libc::SIGTERM {
+                        sig.store(true, Ordering::SeqCst);
+                        eprintln!("\n[Signal] received, stopping replay gracefully...");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    let hw_ports = if args.dry_run || args.sink_file.is_some() {
+        0u8..=0u8
+    } else if args.ports.is_empty() {
+        0u8..=3u8
+    } else {
+        0u8..=0u8
+    };
+    let port_ids: Vec<u8> = if !args.ports.is_empty() {
+        args.ports.clone()
+    } else {
+        hw_ports.collect()
+    };
+
+    let fixed_port = if port_ids.len() == 1 && !args.dry_run { Some(port_ids[0]) } else { None };
+    let strategy = args.strategy.to_injection_strategy(fixed_port);
+
+    let pool = BusPortPool::builder()
+        .ports(port_ids.clone())
+        .strategy(strategy)
+        .dry_run(args.dry_run)
+        .sink_file(args.sink_file.clone())
+        .build()
+        .with_context(|| "Failed to build hardware bus port pool")?;
+
+    if !no_color {
+        println!();
+        println!("{}  {}", "▸ FAULT INJECTION ENGINE ◂".bold().magenta(),
+                 "══════════════════════════".dimmed());
+        println!("{}", "─".repeat(66).dimmed());
+    } else {
+        println!();
+        println!("[FAULT INJECTION ENGINE]");
+        println!("{}", "─".repeat(66));
+    }
+    println!("  Capture file:        {}", args.file.display());
+    println!("  Words to replay:     {}", reader_stats.processed_words);
+    println!("  Capture duration:    {:.3} ms", reader_stats.elapsed_ns as f64 / 1e6);
+    println!("  Replay speed:        x{:.3} {}", args.speed,
+             if (args.speed - 1.0).abs() < 1e-3 { "(real-time)" } else { "" });
+    println!("  Cycles:              {}", args.cycles);
+    println!("  Injection strategy:  {:?}", strategy);
+    println!("  Port pool:           {:?}", pool.port_ids());
+    println!("  Hardware mode:       {}", if args.dry_run {
+        "DRY-RUN (simulated)".to_string()
+    } else if args.sink_file.is_some() {
+        format!("FILE SINK → {}", args.sink_file.as_ref().unwrap().display())
+    } else {
+        format!("HARDWARE /dev/arinc429/tx{}..", port_ids.iter().min().unwrap_or(&0))
+    });
+    println!();
+
+    // ─────────────────────────────── Timing Jitter Preview ────────────────────────────────
+    let pipeline = WordPipeline::new();
+    let (_, _, timing_registry) = pipeline.process_all_timed(timed_words.clone());
+    let preview_top = timing_registry.top_jitter_labels(6);
+    if !preview_top.is_empty() {
+        if !no_color {
+            println!("  {} Detected timing jitter signatures in capture {}",
+                "◉".cyan().bold(),
+                "(potential transient faults):".bold());
+        } else {
+            println!("  Detected timing jitter signatures in capture (potential transient faults):");
+        }
+        print_jitter_table(&preview_top, no_color, 6);
+        println!();
+    }
+
+    // ─────────────────────────────── ENTER Key Trigger ────────────────────────────────
+    if !args.auto_start {
+        if !no_color {
+            println!("  {} {} {}{}{}",
+                "▸".yellow().bold(),
+                "Press ENTER to arm the injector and begin replay".bold(),
+                "(".dimmed(), "ESC / Ctrl-C".bold(), " to cancel)".dimmed());
+        } else {
+            println!("  Press ENTER to begin replay (ESC / Ctrl-C to cancel)");
+        }
+
+        let armed = wait_for_enter_or_escape(stop_flag.clone());
+        if !armed || stop_flag.load(Ordering::SeqCst) {
+            println!();
+            println!("  Injection aborted by user.");
+            return Ok(());
+        }
+        if !no_color {
+            println!();
+            println!("  {} {} {}{}",
+                "▶".green().bold(),
+                "Injector ARMED — launching replay stream now".bold().green(),
+                " at ", chrono_local_now().yellow());
+        } else {
+            println!();
+            println!("  Injector ARMED — launching replay stream now at {}", chrono_local_now());
+        }
+    } else {
+        if !no_color {
+            println!("  {} --auto-start set, skipping user confirmation.",
+                "↯".cyan().bold());
+        } else {
+            println!("  (--auto-start set, skipping user confirmation)");
+        }
+    }
+    println!();
+
+    // ─────────────────────────────── Run Replay ────────────────────────────────
+    let config = ReplayConfig::default()
+        .with_speed_multiplier(args.speed)
+        .with_cycles(args.cycles)
+        .with_strategy(strategy);
+
+    let scheduler = ReplayScheduler::new(config, pool, stop_flag.clone());
+    let result = scheduler.run_with_timestamps(&timed_words)
+        .with_context(|| "Replay scheduler aborted with a fatal error")?;
+
+    // ─────────────────────────────── Final Report ────────────────────────────────
+    println!();
+    if !no_color {
+        println!("{}", "═".repeat(66).dimmed());
+        println!("  {} {}",
+            "▸ INJECTION COMPLETE ◂".bold().green(),
+            result.summary_line().bold());
+    } else {
+        println!("{}", "═".repeat(66));
+        println!("  INJECTION COMPLETE  {}", result.summary_line());
+    }
+    println!("{}", result.detailed_report());
+    if stop_flag.load(Ordering::SeqCst) {
+        if !no_color {
+            println!("  {} Replay was interrupted by user signal.", "✘".yellow().bold());
+        } else {
+            println!("  Replay was interrupted by user signal.");
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_enter_or_escape(stop: Arc<AtomicBool>) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match event::poll(Duration::from_millis(100)) {
+            Ok(true) => {
+                if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+                    match code {
+                        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                            return true;
+                        }
+                        KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(false) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let mut buf = String::new();
+                if std::io::stdin().read_line(&mut buf).is_ok() {
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+}
+
+fn chrono_local_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_secs = since.as_secs();
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    let ms = since.subsec_millis();
+    format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, ms)
+}
+

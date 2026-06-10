@@ -1,0 +1,9 @@
+D:\SOLO-9\68-arinc429-bus-sniffer\target\debug\deps\anstyle_parse-9bf689922ea70bd1.d: C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\lib.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\params.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\mod.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\definitions.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\table.rs
+
+D:\SOLO-9\68-arinc429-bus-sniffer\target\debug\deps\libanstyle_parse-9bf689922ea70bd1.rmeta: C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\lib.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\params.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\mod.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\definitions.rs C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\table.rs
+
+C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\lib.rs:
+C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\params.rs:
+C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\mod.rs:
+C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\definitions.rs:
+C:\Users\ZhuanZ\.cargo\registry\src\mirrors.aliyun.com-0671735e7cc7f5e7\anstyle-parse-1.0.0\src\state\table.rs:

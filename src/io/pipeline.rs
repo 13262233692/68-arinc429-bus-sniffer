@@ -6,10 +6,13 @@ use crate::core::dictionary::{lookup_label, LabelDefinition};
 use crate::decode::{BnrDecoder, bnr::BnrDecodeError};
 use crate::decode::{BcdDecoder, bcd::BcdDecodeError};
 use crate::decode::discrete::*;
+use crate::timing::{LabelTimingRegistry, JitterStats, Timestamp};
+use crate::TimedWord;
 
 #[derive(Debug, Clone)]
 pub struct DecodedWord {
     pub word: ArincWord,
+    pub timestamp: Option<Timestamp>,
     pub label_def: Option<&'static LabelDefinition>,
     pub eng_value: Option<EngineeringValue>,
     pub decode_result: DecodeResult,
@@ -53,6 +56,10 @@ impl WordPipeline {
     }
 
     pub fn process_word(&self, word: ArincWord) -> Option<DecodedWord> {
+        self.process_word_with_ts(word, None)
+    }
+
+    fn process_word_with_ts(&self, word: ArincWord, ts: Option<Timestamp>) -> Option<DecodedWord> {
         if self.skip_parity_invalid && !word.parity_valid() {
             return None;
         }
@@ -71,6 +78,7 @@ impl WordPipeline {
 
         Some(DecodedWord {
             word,
+            timestamp: ts,
             label_def,
             eng_value,
             decode_result,
@@ -208,6 +216,93 @@ impl WordPipeline {
 
         (decoded, stats)
     }
+
+    pub fn process_all_timed(
+        &self,
+        words: Vec<TimedWord>
+    ) -> (Vec<DecodedWord>, PipelineStats, LabelTimingRegistry) {
+        let mut stats = PipelineStats::new();
+        let total = words.len();
+        stats.total_words = total;
+
+        let mut by_label: HashMap<u16, usize> = HashMap::new();
+        let mut by_format: HashMap<&'static str, usize> = HashMap::new();
+        let mut errors_by_type: HashMap<&'static str, usize> = HashMap::new();
+        let timing_registry = LabelTimingRegistry::new();
+
+        let decoded: Vec<DecodedWord> = words
+            .into_iter()
+            .filter_map(|tw| {
+                timing_registry.record(tw.word.label_octal(), tw.timestamp);
+                let result = self.process_word_with_ts(tw.word, Some(tw.timestamp));
+                if let Some(dw) = &result {
+                    let label_octal = dw.word.label_octal();
+                    *by_label.entry(label_octal).or_insert(0) += 1;
+
+                    match &dw.decode_result {
+                        DecodeResult::Success => {
+                            stats.decoded_successfully += 1;
+                            if let Some(def) = dw.label_def {
+                                let fmt_str = match def.format {
+                                    PayloadFormat::Bnr => "BNR",
+                                    PayloadFormat::Bcd => "BCD",
+                                    PayloadFormat::Discrete => "Discrete",
+                                    PayloadFormat::Maintenance => "Maintenance",
+                                    PayloadFormat::Ack => "Ack",
+                                    PayloadFormat::Unknown => "Unknown",
+                                };
+                                *by_format.entry(fmt_str).or_insert(0) += 1;
+                            }
+                        }
+                        DecodeResult::UnknownLabel => {
+                            stats.unknown_labels += 1;
+                            *errors_by_type.entry("UnknownLabel").or_insert(0) += 1;
+                        }
+                        DecodeResult::BnrError(e) => {
+                            stats.decode_errors += 1;
+                            let tag = match e {
+                                BnrDecodeError::OutOfRange { .. } => "BNR:OutOfRange",
+                                BnrDecodeError::InvalidBits { .. } => "BNR:InvalidBits",
+                                BnrDecodeError::SsmSpare => "BNR:SsmSpare",
+                            };
+                            *errors_by_type.entry(tag).or_insert(0) += 1;
+                        }
+                        DecodeResult::BcdError(e) => {
+                            stats.decode_errors += 1;
+                            let tag = match e {
+                                BcdDecodeError::InvalidDigit { .. } => "BCD:InvalidDigit",
+                                BcdDecodeError::TooManyDigits { .. } => "BCD:TooManyDigits",
+                            };
+                            *errors_by_type.entry(tag).or_insert(0) += 1;
+                        }
+                        DecodeResult::FormatNotSupported(_) => {
+                            stats.decode_errors += 1;
+                            *errors_by_type.entry("FormatNotSupported").or_insert(0) += 1;
+                        }
+                        DecodeResult::SpareData => {
+                            stats.spare_data += 1;
+                        }
+                    }
+                } else {
+                    stats.skipped_parity += 1;
+                }
+                result
+            })
+            .collect();
+
+        let sorted_labels = {
+            let mut v: Vec<_> = by_label.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.truncate(15);
+            v
+        };
+
+        stats.top_labels = sorted_labels;
+        stats.format_breakdown = by_format;
+        stats.error_breakdown = errors_by_type;
+
+        (decoded, stats, timing_registry)
+    }
 }
 
 impl Default for WordPipeline {
@@ -228,6 +323,7 @@ pub struct PipelineStats {
     pub top_labels: Vec<(u16, usize)>,
     pub format_breakdown: HashMap<&'static str, usize>,
     pub error_breakdown: HashMap<&'static str, usize>,
+    pub top_jitters: Vec<(u16, JitterStats)>,
 }
 
 impl PipelineStats {
@@ -243,6 +339,7 @@ impl PipelineStats {
             top_labels: Vec::new(),
             format_breakdown: HashMap::new(),
             error_breakdown: HashMap::new(),
+            top_jitters: Vec::new(),
         }
     }
 

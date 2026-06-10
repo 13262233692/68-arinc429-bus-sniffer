@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::core::word::{ArincWord, WordEndianness};
+use crate::timing::{Timestamp, global_precise_clock};
+use crate::TimedWord;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -59,6 +61,31 @@ impl ArincDumpReader {
             DumpFormat::PcapLe => self.read_raw_binary(file_size, WordEndianness::Standard),
             DumpFormat::PcapBe => self.read_raw_binary(file_size, WordEndianness::Reversed),
         }
+    }
+
+    pub fn read_all_timed(&self) -> Result<(Vec<TimedWord>, ReaderStats), ReaderError> {
+        let (words, stats) = self.read_all()?;
+        let clock = global_precise_clock();
+        let start_ts = clock.now();
+        let capture_duration_us = if stats.processed_words > 1 {
+            (stats.elapsed_ns as u64 / 1000).max(1)
+        } else {
+            1
+        };
+        let step_us = capture_duration_us / stats.processed_words.max(1) as u64;
+
+        let timed: Vec<TimedWord> = words
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let synthetic_ts = Timestamp::from_micros(
+                    start_ts.as_micros() + (i as u64) * step_us
+                );
+                TimedWord::new(w, synthetic_ts)
+            })
+            .collect();
+
+        Ok((timed, stats))
     }
 
     fn read_raw_binary(

@@ -68,6 +68,7 @@ dependencies = [
  "colored",
  "crossterm",
  "hex",
+ "libc",
  "memmap2",
  "rand",
  "tabled",

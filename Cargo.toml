@@ -19,6 +19,10 @@ memmap2 = "0.9"
 crossterm = "0.28"
 tabled = "0.16"
 rand = "0.8"
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hex = "0.4"
