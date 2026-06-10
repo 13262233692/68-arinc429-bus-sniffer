@@ -304,19 +304,33 @@ impl Default for PipelineStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::word::WordEndianness;
+    use crate::core::word::{
+        WordEndianness, reverse_bits_u8, generate_odd_parity_bit,
+        DATA_SHIFT, SSM_SHIFT, SDI_SHIFT,
+    };
 
-    fn make_word(raw: u32) -> ArincWord {
+    fn build_test_word(
+        logical_label: u8,
+        sdi: u8,
+        data: u32,
+        ssm_bits: u8,
+    ) -> ArincWord {
+        let raw_label = reverse_bits_u8(logical_label);
+        let mut raw: u32 = 0;
+        raw |= (raw_label as u32) << 0;
+        raw |= ((sdi & 0b11) as u32) << SDI_SHIFT;
+        raw |= (data << DATA_SHIFT) & 0x1FFFFC00;
+        raw |= ((ssm_bits & 0b11) as u32) << SSM_SHIFT;
+        let parity = generate_odd_parity_bit(raw);
+        raw |= parity;
         ArincWord::from_u32(raw, WordEndianness::Standard)
     }
 
     #[test]
     fn test_known_bnr_label() {
         let pipeline = WordPipeline::new();
-
         let data = 400u32;
-        let raw = (data << 10) | 0o001;
-        let word = make_word(raw | 0x80000000);
+        let word = build_test_word(0o001, 0, data, 0b00);
 
         let decoded = pipeline.process_word(word).unwrap();
         assert!(decoded.label_def.is_some());
@@ -328,7 +342,7 @@ mod tests {
     #[test]
     fn test_unknown_label() {
         let pipeline = WordPipeline::new();
-        let word = make_word(0o177);
+        let word = build_test_word(0o177, 0, 0, 0b00);
 
         let decoded = pipeline.process_word(word).unwrap();
         assert!(decoded.label_def.is_none());
@@ -338,14 +352,16 @@ mod tests {
     #[test]
     fn test_skip_parity() {
         let pipeline = WordPipeline::new().skip_parity_invalid(true);
-        let bad_parity_word = make_word(0x00000003);
+        let bad_parity_word = ArincWord::from_u32(0x00000003, WordEndianness::Standard);
+        assert!(!bad_parity_word.parity_valid());
         assert!(pipeline.process_word(bad_parity_word).is_none());
     }
 
     #[test]
     fn test_only_known_labels() {
         let pipeline = WordPipeline::new().only_known_labels(true);
-        let unknown = make_word(0o177 | 0x80000000);
+        let unknown = build_test_word(0o177, 0, 0, 0b00);
+        assert!(unknown.parity_valid());
         assert!(pipeline.process_word(unknown).is_none());
     }
 
@@ -355,13 +371,13 @@ mod tests {
         let mut words: Vec<ArincWord> = Vec::new();
 
         for _ in 0..10 {
-            words.push(make_word(0x80000001u32 | 0o001));
+            words.push(build_test_word(0o001, 0, 400, 0b00));
         }
         for _ in 0..5 {
-            words.push(make_word(0x80000000u32 | 0o002));
+            words.push(build_test_word(0o002, 0, 500, 0b00));
         }
         for _ in 0..3 {
-            words.push(make_word(0x80000000u32 | 0o177));
+            words.push(build_test_word(0o177, 0, 0, 0b00));
         }
 
         let (decoded, stats) = pipeline.process_all(words);
@@ -376,8 +392,8 @@ mod tests {
         let pipeline = WordPipeline::new();
 
         let data = (1 << 0) | (1 << 3) | (1 << 6);
-        let raw = (data << 10) | 0o102 | 0x80000000;
-        let word = make_word(raw);
+        let word = build_test_word(0o102, 0, data, 0b00);
+        assert!(word.parity_valid());
 
         let decoded = pipeline.process_word(word).unwrap();
         assert!(decoded.eng_value.is_some());

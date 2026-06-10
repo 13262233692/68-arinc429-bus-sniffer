@@ -384,10 +384,11 @@ fn cmd_gendata(args: GenDataArgs) -> Result<()> {
     use rand::Rng;
     use rand::SeedableRng;
 
-    use arinc429_sniffer::core::word::{
-        SDI_MASK, DATA_MASK, SSM_MASK, PARITY_MASK,
-        LABEL_SHIFT, SDI_SHIFT, DATA_SHIFT, SSM_SHIFT,
-    };
+use arinc429_sniffer::core::word::{
+    SDI_MASK, DATA_MASK, SSM_MASK,
+    SDI_SHIFT, DATA_SHIFT, SSM_SHIFT,
+    reverse_bits_u8, generate_odd_parity_bit,
+};
 
     println!("Generating {} synthetic ARINC 429 words -> {}",
         args.count, args.output.display());
@@ -408,19 +409,20 @@ fn cmd_gendata(args: GenDataArgs) -> Result<()> {
     for _ in 0..args.count {
         let use_known = rng.gen_bool(0.75);
 
-        let label_val: u8 = if use_known {
+        let logical_label: u8 = if use_known {
             let idx = rng.gen_range(0..know_labels.len());
             know_labels[idx] as u8
         } else {
             rng.gen::<u8>()
         };
 
+        let raw_label = reverse_bits_u8(logical_label);
         let sdi_val: u8 = rng.gen_range(0..4);
         let data_val: u32 = rng.gen_range(0..(1u32 << 19));
         let ssm_val: u8 = rng.gen_range(0..4);
 
         let mut raw: u32 = 0;
-        raw |= (label_val as u32) << LABEL_SHIFT;
+        raw |= (raw_label as u32) << 0;
         raw &= !SDI_MASK;
         raw |= (sdi_val as u32) << SDI_SHIFT;
         raw &= !DATA_MASK;
@@ -428,10 +430,8 @@ fn cmd_gendata(args: GenDataArgs) -> Result<()> {
         raw &= !SSM_MASK;
         raw |= (ssm_val as u32) << SSM_SHIFT;
 
-        let ones = raw.count_ones();
-        if ones % 2 == 0 {
-            raw |= PARITY_MASK;
-        }
+        let parity_bit = generate_odd_parity_bit(raw);
+        raw |= parity_bit;
 
         raw_words.push(raw);
     }
